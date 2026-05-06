@@ -17,10 +17,10 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# ── Config (از environment variables خونده می‌شه) ──
+# ── Config ───────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8617689209:AAHhDPRENnJw8Az6SXjnmGjvFXFfA8ZYKoM")
-DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/tmp/tg_downloads")
-MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "2000"))
+DOWNLOAD_DIR = "/tmp/tg_bot_files"
+MAX_FILE_SIZE_MB = 500
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -32,20 +32,33 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ── Gofile API ───────────────────────────────────────────────────────
+
+async def get_gofile_server() -> str:
+    """بهترین سرور Gofile رو پیدا می‌کنه."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get("https://api.gofile.io/servers") as r:
+            data = await r.json()
+            return data["data"]["servers"][0]["name"]
+
+
+async def upload_to_gofile(filepath: str, filename: str) -> str:
+    """فایل رو آپلود می‌کنه به Gofile و لینک مستقیم برمی‌گردونه."""
+    server = await get_gofile_server()
+    url = f"https://{server}.gofile.io/uploadFile"
+
+    async with aiohttp.ClientSession() as session:
+        with open(filepath, "rb") as f:
+            form = aiohttp.FormData()
+            form.add_field("file", f, filename=filename)
+            async with session.post(url, data=form) as r:
+                data = await r.json()
+                if data["status"] != "ok":
+                    raise Exception(f"Gofile error: {data}")
+                return data["data"]["downloadPage"]
+
+
 # ── Helpers ──────────────────────────────────────────────────────────
-
-def get_filename_from_url(url: str, content_disposition: str = "") -> str:
-    if content_disposition:
-        m = re.search(
-            r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\n]+)',
-            content_disposition,
-            re.IGNORECASE,
-        )
-        if m:
-            return unquote(m.group(1).strip())
-    name = Path(unquote(urlparse(url).path)).name
-    return name or "downloaded_file"
-
 
 def fmt_size(b: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -55,25 +68,18 @@ def fmt_size(b: int) -> str:
     return f"{b:.1f} TB"
 
 
-def file_type(filename: str, mime: str = "") -> str:
-    ext = Path(filename).suffix.lower()
-    if ext in {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv"}:
-        return "video"
-    if ext in {".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a"}:
-        return "audio"
-    if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-        return "photo"
-    if mime.startswith("video"):
-        return "video"
-    if mime.startswith("audio"):
-        return "audio"
-    if mime.startswith("image"):
-        return "photo"
-    return "document"
+def get_filename_from_url(url: str, content_disposition: str = "") -> str:
+    if content_disposition:
+        m = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\n]+)', content_disposition, re.IGNORECASE)
+        if m:
+            return unquote(m.group(1).strip())
+    name = Path(unquote(urlparse(url).path)).name
+    return name or "file"
 
 
-async def download_file(url: str, progress_cb=None) -> tuple[str, str]:
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; TgUploaderBot/1.0)"}
+async def download_from_url(url: str, progress_cb=None) -> tuple[str, str]:
+    """لینک رو دانلود می‌کنه، مسیر فایل و mime رو برمی‌گردونه."""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; TgUploaderBot/2.0)"}
     async with aiohttp.ClientSession(headers=headers) as session:
         async with session.get(url, allow_redirects=True) as r:
             r.raise_for_status()
@@ -82,9 +88,7 @@ async def download_file(url: str, progress_cb=None) -> tuple[str, str]:
             total = int(r.headers.get("Content-Length", 0))
 
             if total and total > MAX_FILE_SIZE_MB * 1024 * 1024:
-                raise ValueError(
-                    f"حجم فایل ({fmt_size(total)}) بیشتر از حد مجاز {MAX_FILE_SIZE_MB} MB است."
-                )
+                raise ValueError(f"حجم فایل ({fmt_size(total)}) بیشتر از {MAX_FILE_SIZE_MB} MB است.")
 
             fname = get_filename_from_url(str(r.url), disp)
             if not Path(fname).suffix and mime:
@@ -102,23 +106,40 @@ async def download_file(url: str, progress_cb=None) -> tuple[str, str]:
             return path, mime
 
 
-def extract_file_id(msg) -> str:
-    for attr in ("video", "audio", "document", "photo"):
-        obj = getattr(msg, attr, None)
-        if obj:
-            return (obj[-1] if isinstance(obj, list) else obj).file_id
-    return "N/A"
+async def download_tg_file(tg_file, filename: str) -> str:
+    """فایل تلگرام رو دانلود می‌کنه."""
+    path = os.path.join(DOWNLOAD_DIR, filename)
+    await tg_file.download_to_drive(path)
+    return path
 
 
-async def send_file(update: Update, path: str, fname: str, ftype: str, mime: str):
-    with open(path, "rb") as f:
-        if ftype == "video":
-            return await update.message.reply_video(video=f, filename=fname, supports_streaming=True)
-        if ftype == "audio":
-            return await update.message.reply_audio(audio=f, filename=fname)
-        if ftype == "photo":
-            return await update.message.reply_photo(photo=f)
-        return await update.message.reply_document(document=f, filename=fname)
+# ── Progress bar ─────────────────────────────────────────────────────
+
+def make_progress_cb(msg, label: str):
+    last = [-1]
+    async def cb(done, total):
+        pct = done / total * 100
+        if pct - last[0] >= 10:
+            last[0] = pct
+            bar = "█" * int(pct // 10) + "░" * (10 - int(pct // 10))
+            await msg.edit_text(
+                f"{label}\n`{bar}` {pct:.0f}%\n{fmt_size(done)} / {fmt_size(total)}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+    return cb
+
+
+# ── Core: process any file and return download link ──────────────────
+
+async def process_and_upload(filepath: str, filename: str, msg) -> str:
+    """فایل رو به Gofile آپلود می‌کنه و لینک دانلود برمی‌گردونه."""
+    size = os.path.getsize(filepath)
+    await msg.edit_text(
+        f"☁️ *آپلود به فضای ابری...*\n📄 `{filename}`\n📦 {fmt_size(size)}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    link = await upload_to_gofile(filepath, filename)
+    return link, size
 
 
 # ── Handlers ─────────────────────────────────────────────────────────
@@ -126,112 +147,116 @@ async def send_file(update: Update, path: str, fname: str, ftype: str, mime: str
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *سلام! ربات آپلودر*\n\n"
-        "• لینک دانلود بفرست → آپلود می‌کنم\n"
-        "• فایل بفرست → File ID می‌دم\n\n"
-        "/help راهنما",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *راهنما*\n\n"
-        "1️⃣ لینک مستقیم بفرست:\n"
-        "`https://example.com/file.mp4`\n\n"
-        "2️⃣ یا فایل مستقیم بفرست\n"
-        "   (ویدیو / موزیک / عکس / سند)\n\n"
-        f"⚠️ حداکثر حجم: {MAX_FILE_SIZE_MB} MB",
+        "هر چیزی بفرست یا لینک بده:\n"
+        "• 🔗 لینک دانلود\n"
+        "• 🖼 عکس\n"
+        "• 🎬 ویدیو\n"
+        "• 🎵 موزیک\n"
+        "• 📄 هر فایلی\n\n"
+        "یه *لینک مستقیم دانلود* برات می‌سازم! ⬇️",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """لینک دانلود رو پردازش می‌کنه."""
     url = update.message.text.strip()
     if not re.match(r"https?://", url):
-        await update.message.reply_text("❌ لینک باید با http:// یا https:// شروع بشه.")
+        await update.message.reply_text("❌ لینک معتبر نیست.")
         return
 
     msg = await update.message.reply_text("⏳ در حال بررسی لینک...")
-    last_pct = [-1]
-
-    async def on_progress(done: int, total: int):
-        pct = done / total * 100
-        if pct - last_pct[0] >= 10:
-            last_pct[0] = pct
-            bar = "█" * int(pct // 10) + "░" * (10 - int(pct // 10))
-            await msg.edit_text(
-                f"📥 *دانلود...*\n`{bar}` {pct:.0f}%\n{fmt_size(done)} / {fmt_size(total)}",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-
     filepath = None
     try:
+        cb = make_progress_cb(msg, "📥 *دانلود...*")
         await msg.edit_text("📥 شروع دانلود...")
-        filepath, mime = await download_file(url, on_progress)
+        filepath, mime = await download_from_url(url, cb)
+        filename = Path(filepath).name
 
-        fname = Path(filepath).name
-        fsize = os.path.getsize(filepath)
-        ftype = file_type(fname, mime)
-
-        await msg.edit_text(
-            f"📤 *آپلود به تلگرام...*\n📄 `{fname}`\n📦 {fmt_size(fsize)}",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-
-        sent = await send_file(update, filepath, fname, ftype, mime)
-        fid = extract_file_id(sent)
+        link, size = await process_and_upload(filepath, filename, msg)
 
         await msg.edit_text(
-            f"✅ *آپلود موفق!*\n\n📄 `{fname}`\n📦 {fmt_size(fsize)}\n🆔 File ID:\n`{fid}`",
+            f"✅ *آماده‌ست!*\n\n"
+            f"📄 `{filename}`\n"
+            f"📦 {fmt_size(size)}\n\n"
+            f"🔗 *لینک دانلود:*\n{link}",
             parse_mode=ParseMode.MARKDOWN,
         )
 
     except ValueError as e:
         await msg.edit_text(f"❌ {e}")
-    except aiohttp.ClientError as e:
-        await msg.edit_text(f"❌ خطا در دانلود:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.exception("handle_url error")
-        await msg.edit_text(f"❌ خطای غیرمنتظره:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        await msg.edit_text(f"❌ خطا:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
     finally:
         if filepath and os.path.exists(filepath):
             os.remove(filepath)
 
 
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """فایل ارسالی کاربر رو پردازش می‌کنه."""
     m = update.message
+
     if m.document:
-        obj, fname = m.document, m.document.file_name or "file"
+        tg_file = await m.document.get_file()
+        filename = m.document.file_name or "file"
+        size = m.document.file_size or 0
     elif m.video:
-        obj, fname = m.video, m.video.file_name or "video.mp4"
+        tg_file = await m.video.get_file()
+        filename = m.video.file_name or "video.mp4"
+        size = m.video.file_size or 0
     elif m.audio:
-        obj, fname = m.audio, m.audio.file_name or "audio.mp3"
+        tg_file = await m.audio.get_file()
+        filename = m.audio.file_name or "audio.mp3"
+        size = m.audio.file_size or 0
     elif m.photo:
-        obj, fname = m.photo[-1], "photo.jpg"
+        tg_file = await m.photo[-1].get_file()
+        filename = "photo.jpg"
+        size = m.photo[-1].file_size or 0
     elif m.voice:
-        obj, fname = m.voice, "voice.ogg"
+        tg_file = await m.voice.get_file()
+        filename = "voice.ogg"
+        size = m.voice.file_size or 0
     else:
         return
 
-    fsize = getattr(obj, "file_size", 0) or 0
-    await m.reply_text(
-        f"✅ *فایل دریافت شد!*\n\n📄 `{fname}`\n📦 {fmt_size(fsize)}\n🆔 File ID:\n`{obj.file_id}`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    if size > MAX_FILE_SIZE_MB * 1024 * 1024:
+        await m.reply_text(f"❌ حجم فایل بیشتر از {MAX_FILE_SIZE_MB} MB است.")
+        return
+
+    msg = await m.reply_text("📥 در حال دریافت فایل از تلگرام...")
+    filepath = None
+    try:
+        filepath = await download_tg_file(tg_file, filename)
+        link, fsize = await process_and_upload(filepath, filename, msg)
+
+        await msg.edit_text(
+            f"✅ *آماده‌ست!*\n\n"
+            f"📄 `{filename}`\n"
+            f"📦 {fmt_size(fsize)}\n\n"
+            f"🔗 *لینک دانلود:*\n{link}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+    except Exception as e:
+        logger.exception("handle_file error")
+        await msg.edit_text(f"❌ خطا:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+    finally:
+        if filepath and os.path.exists(filepath):
+            os.remove(filepath)
 
 
-# ── Entry point ──────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO | filters.VOICE,
         handle_file,
     ))
-    logger.info("Bot started.")
+    logger.info("Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
